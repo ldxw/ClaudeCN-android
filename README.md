@@ -190,8 +190,8 @@ echo "sdk.dir=/path/to/Android/sdk" > local.properties
 `.github/workflows/android.yml` 在每次 push 到 `main` / `master`、每次 pull request，以及手动 `workflow_dispatch` 时执行：
 
 1. `actions/checkout@v4`
-2. `actions/setup-java@v4`（temurin 17）
-3. `android-actions/setup-android@v3`，安装 `platforms;android-34` 与 `build-tools;34.0.0`
+2. `actions/setup-java@v5`（temurin 17）
+3. 检查 runner 的 `ANDROID_HOME`，确认 `platforms;android-34` 与 `build-tools;34.0.0` 存在，缺件才用 `sdkmanager` 补装 —— `ubuntu-latest` 镜像已预装这两项
 4. `gradle/actions/setup-gradle@v4`（含依赖缓存）
 5. `./gradlew assembleDebug`
 6. `./gradlew lintDebug`
