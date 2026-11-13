@@ -2,16 +2,96 @@ plugins {
     id 'com.android.application'
 }
 
+// 版本号与签名材料由环境变量注入；本地不带这些变量时回落到默认值。
+def envOr = { String key, String fallback ->
+    def v = System.getenv(key)
+    (v != null && !v.trim().isEmpty()) ? v.trim() : fallback
+}
+
+// 版本名的唯一来源是仓库根目录的 version.properties；CI 打标签或手动触发时用
+// VERSION_NAME 环境变量覆盖它，不改文件。
+def versionProps = new Properties()
+def versionPropsFile = rootProject.file('version.properties')
+if (versionPropsFile.exists()) {
+    versionPropsFile.withInputStream { versionProps.load(it) }
+}
+def versionNameFromFile = versionProps.getProperty('versionName', '1.0.1').trim()
+def versionNameOverride = envOr('VERSION_NAME', versionNameFromFile)
+
+// versionCode 由 versionName 推导：major*10000 + minor*100 + patch。
+// 1.0.1 → 10001，1.2.3 → 10203。每段到 99 为止，够用到 4.x。
+// 好处是两者永不错位、同一版本号重编得到同一个 code；
+// VERSION_CODE 环境变量仍可覆盖，用于个别需要手工指定序号的场合。
+// 预发布后缀（-rc1 / -beta2）不参与推导：1.0.2-rc1 与 1.0.2 同为 10201，
+// versionName 保留后缀，Release 页面据标签名标成 pre-release。
+def versionCodeFromName = { String name ->
+    def m = (name =~ /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/)
+    if (!m.matches()) {
+        throw new GradleException("versionName 需为 x.y.z 形式（可带 -rc/-beta 后缀），当前为 \"${name}\"")
+    }
+    int major = m.group(1).toInteger()
+    int minor = m.group(2).toInteger()
+    int patch = m.group(3).toInteger()
+    if (minor > 99 || patch > 99) {
+        throw new GradleException("versionName 的 minor / patch 不能超过 99，当前为 \"${name}\"")
+    }
+    return major * 10000 + minor * 100 + patch
+}
+
+def explicitVersionCode = envOr('VERSION_CODE', '')
+def versionCodeOverride = explicitVersionCode.isEmpty()
+        ? versionCodeFromName(versionNameOverride)
+        : explicitVersionCode.toInteger()
+
+def keystorePath = envOr('KEYSTORE_PATH', '')
+def hasKeystore = !keystorePath.isEmpty() && file(keystorePath).exists()
+
 android {
     namespace 'com.host1syan.claudecn'
     compileSdk 34
+    ndkVersion envOr('NDK_VERSION', '27.3.13750724')
 
     defaultConfig {
         applicationId "com.host1syan.claudecn"
         minSdk 21
         targetSdk 34
-        versionCode 3
-        versionName "1.0.1"
+        versionCode versionCodeOverride
+        versionName versionNameOverride
+    }
+
+    // 唯一一处 JNI：NativeAbi 报告进程实际加载的 .so 属于哪个 ABI。
+    // 目标架构不在这里指定，由上面的 splits.abi.include 覆盖；两处同时写 AGP 会报冲突。
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+
+    // 按 ABI 拆分：每个分包只带自己那份 libclaudecn.so，universal 包含全部四份。
+    // 新增 native 库时无需改这里，凡是被 CMake 引入的库都会按同样四个架构分包。
+    splits {
+        abi {
+            enable true
+            reset()
+            include 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+            universalApk true
+        }
+    }
+
+    signingConfigs {
+        if (hasKeystore) {
+            release {
+                storeFile file(keystorePath)
+                storePassword envOr('KEYSTORE_PASSWORD', '')
+                keyAlias envOr('KEY_ALIAS', '')
+                keyPassword envOr('KEY_PASSWORD', '')
+                // AGP 默认只开 v1/v2；显式补上 v3，覆盖 Android 9+ 的密钥轮换场景
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
     }
 
     buildFeatures {
@@ -22,6 +102,9 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasKeystore) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

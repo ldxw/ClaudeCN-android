@@ -10,6 +10,8 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import com.host1syan.claudecn.BuildConfig;
+import com.host1syan.claudecn.NativeAbi;
 import com.host1syan.claudecn.R;
 
 public class SettingsActivity extends Activity {
@@ -67,7 +69,7 @@ public class SettingsActivity extends Activity {
         row2.addView(imageView, new LinearLayout.LayoutParams(dp2, dp2));
         Ui.addGap(row2, this, 0);
         TextView textView = new TextView(this);
-        textView.setText("ClaudeCN 客户端 1.0.1");
+        textView.setText("ClaudeCN 客户端 " + BuildConfig.VERSION_NAME);
         textView.setTextSize(12.0f);
         textView.setTextColor(this.palette.textMuted);
         textView.setIncludeFontPadding(false);
@@ -75,6 +77,12 @@ public class SettingsActivity extends Activity {
         wrapWrap.leftMargin = Ui.dp(this, 8.0f);
         row2.addView(textView, wrapWrap);
         column.addView(row2, Ui.matchWrap());
+        Ui.addGap(column, this, 6);
+        TextView abiText = Ui.body(this, "架构 " + NativeAbi.abi(), this.palette);
+        abiText.setTextSize(11.0f);
+        abiText.setTextColor(this.palette.textMuted);
+        abiText.setGravity(17);
+        column.addView(abiText, Ui.matchWrap());
         setContentView(scrollView);
     }
 
