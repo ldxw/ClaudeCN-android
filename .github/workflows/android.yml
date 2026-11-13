@@ -1,27 +1,46 @@
-name: Android CI
+name: Android Release
 
+# 只在两种情况下构建：
+#   1. 推送 v* 标签（如 v1.0.1）——自动构建并发布 Release
+#   2. 在 Actions 页面手动触发——默认只产出构建产物，勾选 publish 才发布 Release
 on:
   push:
-    branches: [main, master]
-  pull_request:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version_name:
+        description: '版本名（如 1.0.2），留空则取 version.properties'
+        required: false
+        default: ''
+      version_code:
+        description: '版本号（整数），留空则由版本名推导（major*10000+minor*100+patch）'
+        required: false
+        default: ''
+      publish:
+        description: '构建完成后发布到 Releases 页面'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build & Lint
+  release:
+    name: Build & Release
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 版本名不再依赖 git 历史，但自动生成的发布说明需要完整提交与标签来分类
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -61,6 +80,10 @@ jobs:
 
           install_if_missing platforms/android-34 "platforms;android-34"
           install_if_missing build-tools/34.0.0 "build-tools;34.0.0"
+          # 工程含一处 JNI（NativeAbi），需要 NDK 与 CMake。
+          # ubuntu-latest 镜像已带 ndk;27.3.13750724 与 cmake;3.22.1，通常不会走到安装分支。
+          install_if_missing ndk/27.3.13750724 "ndk;27.3.13750724"
+          install_if_missing cmake/3.22.1 "cmake;3.22.1"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -68,17 +91,140 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Build debug APK
-        run: ./gradlew --no-daemon --stacktrace assembleDebug
+      # versionName 的优先级：标签名 > 手动输入 > version.properties。
+      # versionCode 默认不传，由 app/build.gradle 用 versionName 推导（major*10000+minor*100+patch），
+      # 保证 CI 包与本地包同版本同 code；只有手动输入 version_code 时才覆盖。
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
 
-      - name: Run lint
-        run: ./gradlew --no-daemon lintDebug
+          file_name="$(sed -n 's/^versionName *= *//p' version.properties | tail -1)"
+          if [ -z "${file_name}" ]; then
+            echo "version.properties 缺少 versionName" >&2
+            exit 1
+          fi
 
-      - name: Upload debug APK
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            name="${GITHUB_REF_NAME#v}"
+            source="标签 ${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_VERSION_NAME}" ]; then
+            name="${INPUT_VERSION_NAME#v}"
+            source="手动输入"
+          else
+            name="${file_name}"
+            source="version.properties"
+          fi
+
+          case "${name}" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            '') echo "版本名不能为空" >&2; exit 1 ;;
+            *) echo "版本名需为 x.y.z 形式: ${name}" >&2; exit 1 ;;
+          esac
+
+          if [ -n "${INPUT_VERSION_CODE}" ]; then
+            case "${INPUT_VERSION_CODE}" in
+              *[!0-9]*) echo "版本号必须是整数: ${INPUT_VERSION_CODE}" >&2; exit 1 ;;
+            esac
+            code="${INPUT_VERSION_CODE}"
+          else
+            # 空值 = 不覆盖，交给 Gradle 从 versionName 推导
+            code=""
+          fi
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${name}" >> "$GITHUB_OUTPUT"
+          echo "版本: name=${name}（来源：${source}） code=${code:-由 versionName 推导}"
+
+      - name: Compose release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          hand=".github/release-notes/v${{ steps.version.outputs.name }}.md"
+          body="${RUNNER_TEMP}/release-body.md"
+          if [ -f "$hand" ]; then
+            cat "$hand" > "$body"
+            echo "使用手写发布说明: $hand"
+          else
+            # body 留空会让 action 的正文与自动生成笔记拼接行为不明确，给一句占位说明
+            echo "本次发布未提供手写要点，变更见下方自动生成内容。" > "$body"
+            echo "未找到 $hand，使用占位说明 + 自动生成笔记"
+          fi
+          echo "body_path=${body}" >> "$GITHUB_OUTPUT"
+
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64}" ]; then
+            echo "缺少 KEYSTORE_BASE64 secret，无法签名 release 包" >&2
+            exit 1
+          fi
+          printf '%s' "${KEYSTORE_B64}" | base64 --decode > "${RUNNER_TEMP}/release.jks"
+          echo "keystore 已写入 ${RUNNER_TEMP}/release.jks"
+
+      - name: Build release APKs
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --stacktrace assembleRelease lintDebug
+
+      # 五个包都收集：universal 供 Release 使用，四个 ABI 分包作为 workflow artifact。
+      # 输出 path 只指向 universal，Publish release 因此仍只挂一个附件。
+      - name: Collect release APKs
+        id: apk
+        run: |
+          set -euo pipefail
+          src="app/build/outputs/apk/release"
+          ver="${{ steps.version.outputs.name }}"
+          abis="arm64-v8a armeabi-v7a x86 x86_64"
+
+          missing=""
+          for abi in $abis; do
+            [ -f "${src}/app-${abi}-release.apk" ] || missing="${missing} ${abi}"
+          done
+          if [ -n "$missing" ]; then
+            echo "缺少 ABI 分包:${missing}" >&2
+            find "$src" -type f >&2 || true
+            exit 1
+          fi
+          if [ ! -f "${src}/app-universal-release.apk" ]; then
+            echo "缺少 universal 包" >&2
+            find "$src" -type f >&2 || true
+            exit 1
+          fi
+
+          universal="ClaudeCN-${ver}-universal.apk"
+          cp "${src}/app-universal-release.apk" "$universal"
+          for abi in $abis; do
+            cp "${src}/app-${abi}-release.apk" "ClaudeCN-${ver}-${abi}.apk"
+          done
+
+          apksigner="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
+          for f in ClaudeCN-${ver}-*.apk; do
+            "$apksigner" verify "$f" >/dev/null
+          done
+          "$apksigner" verify --print-certs "$universal"
+          sha256sum ClaudeCN-${ver}-*.apk
+
+          echo "path=${universal}" >> "$GITHUB_OUTPUT"
+
+      # 手动触发且未勾 publish 时上传全部五个包到 artifact；标签触发直接进 Release，不留 artifact。
+      - name: Upload build artifacts
+        if: github.ref_type != 'tag' && inputs.publish != true
         uses: actions/upload-artifact@v4
         with:
-          name: claudecn-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: ClaudeCN-${{ steps.version.outputs.name }}-apks
+          path: ClaudeCN-${{ steps.version.outputs.name }}-*.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -89,4 +235,19 @@ jobs:
           name: lint-report
           path: app/build/reports/lint-results-debug.*
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 14
+
+      # 标签推送必定发布；手动触发需显式勾选 publish
+      - name: Publish release
+        if: github.ref_type == 'tag' || inputs.publish == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ClaudeCN ${{ steps.version.outputs.name }}
+          body_path: ${{ steps.notes.outputs.body_path }}
+          generate_release_notes: true
+          # 同一个标签重复发布时覆盖已有附件，避免失败
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          files: ${{ steps.apk.outputs.path }}
