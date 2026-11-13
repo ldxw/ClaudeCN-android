@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 应用内检查更新后唤起系统安装器 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:extractNativeLibs="true"
@@ -42,6 +44,13 @@
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize|uiMode"
             android:exported="false"
             android:label="设置" />
+
+        <!-- 只向系统安装器暴露 cache/updates 下的 apk，其他路径与写入请求一律拒绝 -->
+        <provider
+            android:name="com.host1syan.claudecn.update.ApkProvider"
+            android:authorities="com.host1syan.claudecn.updates"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 
 </manifest>

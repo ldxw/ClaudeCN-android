@@ -1,7 +1,9 @@
 package com.host1syan.claudecn.ui;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -20,11 +22,15 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import com.host1syan.claudecn.BuildConfig;
 import com.host1syan.claudecn.R;
 import com.host1syan.claudecn.cache.AssetCache;
 import com.host1syan.claudecn.cache.CnWebViewClient;
 import com.host1syan.claudecn.model.ServerConfig;
 import com.host1syan.claudecn.store.ServerStore;
+import com.host1syan.claudecn.update.UpdateChecker;
+import com.host1syan.claudecn.update.UpdateInfo;
+import com.host1syan.claudecn.update.UpdateSettings;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -50,6 +56,9 @@ public class MainActivity extends Activity implements StatusBridge.Listener {
     private final Map<String, CnWebViewClient> clients = new HashMap();
     private final Map<String, StatusBridge> bridges = new HashMap();
     private final Map<String, Integer> states = new HashMap();
+    /** 自动检查更新：同一时刻只跑一次，避免重复弹窗。 */
+    private boolean updateCheckRunning;
+    private boolean updateDialogShowing;
 
     @Override
     protected void onCreate(Bundle bundle) {
@@ -71,6 +80,81 @@ public class MainActivity extends Activity implements StatusBridge.Listener {
         linearLayout.addView(buildTabBar(), new LinearLayout.LayoutParams(-1, Ui.dp(this, 56.0f)));
         setContentView(linearLayout);
         registerNetworkCallback();
+        autoCheckUpdate();
+    }
+
+    /**
+     * 启动时自动检查更新：受「自动检查」开关与 24 小时间隔约束，失败静默。
+     * 结果只负责提示，下载与安装仍在设置页完成。
+     */
+    private void autoCheckUpdate() {
+        if (this.updateCheckRunning || this.updateDialogShowing) {
+            return;
+        }
+        if (!UpdateSettings.shouldCheck(this, System.currentTimeMillis())) {
+            return;
+        }
+        this.updateCheckRunning = true;
+        UpdateChecker.checkAsync(new UpdateChecker.Callback() {
+            @Override
+            public void onResult(UpdateInfo info) {
+                MainActivity.this.updateCheckRunning = false;
+                if (MainActivity.this.isFinishing()) {
+                    return;
+                }
+                if (info == null || info.error != null) {
+                    return;
+                }
+                UpdateSettings.markChecked(MainActivity.this, System.currentTimeMillis());
+                if (!info.newer || !info.hasAsset()) {
+                    return;
+                }
+                if (UpdateSettings.isNotified(MainActivity.this, info.versionName)) {
+                    return;
+                }
+                MainActivity.this.showUpdateDialog(info);
+            }
+        });
+    }
+
+    private void showUpdateDialog(final UpdateInfo info) {
+        if (this.isFinishing() || this.updateDialogShowing) {
+            return;
+        }
+        this.updateDialogShowing = true;
+        String notes = info.notes == null ? "" : info.notes.trim();
+        String message = "当前版本 " + BuildConfig.VERSION_NAME + "，最新版本 "
+                + info.versionName + "。";
+        if (!notes.isEmpty()) {
+            message = message + "\n\n" + notes;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("发现新版本 " + info.versionName)
+                .setMessage(message)
+                .setPositiveButton("去更新", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        MainActivity.this.updateDialogShowing = false;
+                        UpdateSettings.markNotified(MainActivity.this, info.versionName);
+                        MainActivity.this.startActivity(new Intent(MainActivity.this,
+                                SettingsActivity.class)
+                                .putExtra(SettingsActivity.EXTRA_CHECK_NOW, true));
+                    }
+                })
+                .setNegativeButton("忽略", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        MainActivity.this.updateDialogShowing = false;
+                        UpdateSettings.markNotified(MainActivity.this, info.versionName);
+                    }
+                })
+                .setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override
+                    public void onCancel(DialogInterface dialog) {
+                        MainActivity.this.updateDialogShowing = false;
+                    }
+                })
+                .show();
     }
 
     private View buildEmptyState() {
@@ -240,6 +324,8 @@ public class MainActivity extends Activity implements StatusBridge.Listener {
                     @Override
                     public void run() {
                         MainActivity.this.healConnections();
+                        // 启动时若没网，联网后补一次；shouldCheck 会拦掉 24 小时内的重复
+                        MainActivity.this.autoCheckUpdate();
                     }
                 });
             }
