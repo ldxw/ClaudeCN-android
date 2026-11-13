@@ -4,7 +4,7 @@
 
 源码由官方安卓客户端逆向还原而来（见[代码来源](#代码来源)）。**本项目不含任何服务端逻辑**，只是给官方程序套的一层安卓客户端；服务端的部署、模型路由、会话管理都由官方项目提供。
 
-纯 Java，零第三方依赖，全部界面用代码构建（无 layout XML）。`minSdk 21` / `targetSdk 34`。
+纯 Java，零第三方依赖，全部界面用代码构建（无 layout XML）。`minSdk 21` / `targetSdk 34`。仅有的 native 代码是一份自写的二十余行 `.so`，用于报告当前 APK 实际加载的 ABI（见[构建产物形态](#构建产物形态abi)）。
 
 ---
 
@@ -19,7 +19,9 @@
 - 零第三方依赖，`app/build.gradle` 中没有 `implementation` 行，与 `android.useAndroidX=false` 一致。
 - 权限、`minSdk 21` / `targetSdk 34`、启动 Activity 与原包一致。
 - 顶栏的 `⟳` 刷新按钮是在还原基础上新增的功能，原包没有。
+- 原包不含 native 库；本工程新增了一份自写的 `libclaudecn.so`，仅用于让界面显示实际加载的 ABI。
 - 使用自建证书签名，与原包签名不同，**不能覆盖安装原版 APK**，需先卸载。
+- **versionCode 不再与原包一致**：改为由 `versionName` 按 `major*10000+minor*100+patch` 推导，`1.0.1` → `10001`（原包为 3）。这是有意的取舍，见[版本号](#版本号)。
 
 ---
 
@@ -153,9 +155,19 @@ WebView 侧开启 `LOAD_CACHE_ELSE_NETWORK`、DOM Storage、Database，允许第
 | compileSdk / targetSdk | 34 |
 | minSdk | 21 |
 | Android SDK Build-Tools | 34.0.0 |
+| Android NDK | 27.3.13750724（`ndkVersion`，可用 `NDK_VERSION` 环境变量覆盖） |
+| CMake | 3.22.1（Android SDK 组件，非系统 CMake） |
 | AndroidX | 未使用（`android.useAndroidX=false`） |
 
 没有任何 `implementation` 依赖；`settings.gradle` 里的 google / mavenCentral 仓库仅用于拉取 AGP 与 Gradle 插件。
+
+NDK 与 CMake 只用于编译那一个 `abi.c`，通过 SDK Manager 安装：
+
+```bash
+sdkmanager --install "ndk;27.3.13750724" "cmake;3.22.1"
+```
+
+首次构建时 Gradle 会用 CMake 为四个 ABI 各编一次，之后增量构建不会再碰 native 部分。
 
 ---
 
@@ -178,32 +190,123 @@ echo "sdk.dir=/path/to/Android/sdk" > local.properties
 ```bash
 ./gradlew lintDebug            # 静态检查，报告在 app/build/reports/
 ./gradlew clean                # 清理
-./gradlew assembleRelease      # release 变体（默认 unsigned）
+./gradlew assembleRelease      # release 变体（未注入签名环境变量时为 unsigned）
 ```
 
 `local.properties` 已在 `.gitignore` 中；CI 通过 `ANDROID_HOME` 定位 SDK，不依赖该文件。
 
 ---
 
-## CI 构建
+## 构建产物形态（ABI）
 
-`.github/workflows/android.yml` 在每次 push 到 `main` / `master`、每次 pull request，以及手动 `workflow_dispatch` 时执行：
+`app/build.gradle` 里开启了 `splits.abi`，包含 `armeabi-v7a`、`arm64-v8a`、`x86`、`x86_64` 四个 ABI，并额外产出 universal 包，所以 `assembleRelease` 会得到 5 个 APK：
 
-1. `actions/checkout@v4`
+```
+app/build/outputs/apk/release/
+├── app-armeabi-v7a-release.apk   # 只含 lib/armeabi-v7a/libclaudecn.so
+├── app-arm64-v8a-release.apk     # 只含 lib/arm64-v8a/libclaudecn.so
+├── app-x86-release.apk           # 只含 lib/x86/libclaudecn.so
+├── app-x86_64-release.apk        # 只含 lib/x86_64/libclaudecn.so
+└── app-universal-release.apk     # 四份都含
+```
+
+四个分包之间只差 `lib/` 那一份 `.so`，其余 dex 与资源完全相同；universal 是四个分包的并集。体积差在几 KB 量级 —— 这份 `.so` 只有二十余行 C。Releases 页面只挂 universal 包，避免同一份字节传五遍。
+
+### 那个 `.so` 是干什么的
+
+`app/src/main/cpp/abi.c` 里只有一个 JNI 函数：编译期用 `__aarch64__` / `__arm__` / `__x86_64__` / `__i386__` 判断自己属于哪个架构，运行时把字符串返回给 Java 的 `NativeAbi`，最终显示在设置页底部（「架构 arm64-v8a」）。
+
+它回答的是 **包管理器实际解出来的是哪一份库**，这一点 Java 层拿不到：
+
+| 信息源 | 回答的问题 |
+| --- | --- |
+| `Build.SUPPORTED_ABIS` | 设备支持哪些架构（可能是 `arm64-v8a, armeabi-v7a`） |
+| `Process.is64Bit()` | 应用进程是 64 位还是 32 位 |
+| `NativeAbi.abi()` | 当前 APK 里的这份 `.so` 自报的架构 |
+
+在 universal 包上装到 32 位设备时，前两者给不出「加载的其实是 armeabi-v7a 那份」的答案，这也是引入它的理由。
+
+加载失败时 `NativeAbi` 会捕获 `Throwable`，降级为「未加载」，界面不受影响 —— 所以把它砍掉也不会崩。
+
+不需要分包时可以直接关掉：把 `splits { abi { ... } }` 整块删掉，或把 `enable` 改为 `false`。若同时删掉 `externalNativeBuild` 与 `app/src/main/cpp/`，`NativeAbi` 会自动走降级分支。
+
+---
+
+## CI 与发布
+
+`.github/workflows/android.yml` 只在两种情况下运行，push 到分支和 pull request **不会**触发构建：
+
+| 触发方式 | 行为 |
+| --- | --- |
+| 推送 `v*` 标签（如 `v1.0.2`） | 构建签名 release 包，创建或更新对应标签的 GitHub Release |
+| Actions 页面手动 `Run workflow` | 构建签名 release 包，默认把 5 个包上传为 workflow artifact；勾选 `publish` 才发布 Release |
+
+上传产物时，artifact（名为 `ClaudeCN-<version>-apks`）包含 universal 与四个 ABI 分包共 5 个 APK，保留 30 天；Release 附件只挂 universal 一个，避免同一份字节传五遍。
+
+版本名与版本号的取值规则见[版本号](#版本号)。标签触发时版本名直接取标签去掉 `v` 前缀；手动触发可填 `version_name` / `version_code`，两者留空都回落到 `version.properties` 与派生规则。
+
+流程：
+
+1. `actions/checkout@v4`（`fetch-depth: 0`，发布说明的自动分类需要完整提交历史）
 2. `actions/setup-java@v5`（temurin 17）
-3. 检查 runner 的 `ANDROID_HOME`，确认 `platforms;android-34` 与 `build-tools;34.0.0` 存在，缺件才用 `sdkmanager` 补装 —— `ubuntu-latest` 镜像已预装这两项
+3. 检查 runner 的 `ANDROID_HOME`，确认 `platforms;android-34`、`build-tools;34.0.0`、`ndk;27.3.13750724`、`cmake;3.22.1` 存在，缺件才用 `sdkmanager` 补装 —— `ubuntu-latest` 镜像已预装这四项
 4. `gradle/actions/setup-gradle@v4`（含依赖缓存）
-5. `./gradlew assembleDebug`
-6. `./gradlew lintDebug`
-7. 上传 `app/build/outputs/apk/debug/*.apk` 为 artifact `claudecn-debug`；lint 报告单独作为 `lint-report` 上传（失败时也传）
+5. 解析版本号，拼接发布说明
+6. 从 secret 解码 keystore 到 `$RUNNER_TEMP/release.jks`
+7. `./gradlew assembleRelease lintDebug`，签名材料通过环境变量注入 Gradle
+8. 校验 5 个包齐全后统一改名为 `ClaudeCN-<version>-<abi>.apk` / `-universal.apk`，逐个 `apksigner verify`，对 universal 加 `--print-certs` 打印证书指纹，最后打印全部 SHA-256
+9. 标签触发或勾选 `publish` 时创建/更新 Release，附件为 `ClaudeCN-<version>-universal.apk`
 
-流水线只产出 debug APK，不涉及签名密钥。要发正式包请走下面的签名流程，或在仓库 Secrets 里配置 keystore 后自行扩展 workflow。
+### 需要的仓库 Secrets
+
+在 Settings → Secrets and variables → Actions 里添加 4 个 secret：
+
+| Secret | 内容 |
+| --- | --- |
+| `KEYSTORE_BASE64` | release keystore 的 base64，生成方式见下 |
+| `KEYSTORE_PASSWORD` | keystore 口令 |
+| `KEY_ALIAS` | 密钥别名 |
+| `KEY_PASSWORD` | 密钥口令 |
+
+`KEYSTORE_BASE64` 的生成方式（在持有 keystore 的机器上执行）：
+
+```bash
+base64 -w 0 my-release.jks > keystore.b64   # macOS 用 base64 -i my-release.jks -o keystore.b64
+```
+
+把 `keystore.b64` 的内容整段粘贴进 secret。keystore 本身不要提交进仓库。
+
+### 发布说明
+
+Release 正文由两部分拼接：
+
+- **手写要点**：`.github/release-notes/v<version>.md`（例如 `v1.0.1.md`），存在时放在正文最前面；不存在则跳过，不报错。
+- **自动生成**：`generate_release_notes: true` 按 commit 与 PR 自动分类追加。
+
+GitHub 会自动为每个 Release 附上 `Source code (zip)` 与 `Source code (tar.gz)`，不需要手工打包源码。
+
+标签名带 `-rc` 或 `-beta` 时自动标记为 pre-release。
 
 ---
 
 ## 签名与安装
 
-release 变体默认 **unsigned**（`app/build.gradle` 中没有 `signingConfig`），需要手动签名：
+CI 用仓库 Secrets 里的 keystore 签 release 包，本地没有这些环境变量时 `assembleRelease` 产出的是 unsigned 包。
+
+本地签名时，先让 Gradle 读到签名材料，`app/build.gradle` 会按环境变量自动启用 `signingConfig`：
+
+```bash
+export KEYSTORE_PATH=/abs/path/my-release.jks
+export KEYSTORE_PASSWORD='...'
+export KEY_ALIAS=mykey
+export KEY_PASSWORD='...'
+
+./gradlew assembleRelease
+```
+
+产物直接是已签名、已对齐的 `app/build/outputs/apk/release/app-universal-release.apk`，无需再手工 `zipalign` + `apksigner`。
+
+若要脱离 Gradle 手工签名：
 
 ```bash
 ./gradlew assembleRelease
@@ -211,7 +314,7 @@ release 变体默认 **unsigned**（`app/build.gradle` 中没有 `signingConfig`
 BT=$ANDROID_HOME/build-tools/34.0.0
 
 $BT/zipalign -p -f 4 \
-  app/build/outputs/apk/release/app-release-unsigned.apk \
+  app/build/outputs/apk/release/app-universal-release.apk \
   app-release-aligned.apk
 
 $BT/apksigner sign \
@@ -240,7 +343,54 @@ keytool -genkeypair -v -keystore my-release.jks -alias mykey \
 adb install -r app-release-signed.apk
 ```
 
-首次打开为空状态页，点「添加服务器」填入地址即可。
+---
+
+## 版本号
+
+版本名（`versionName`）的唯一来源是仓库根目录的 `version.properties`：
+
+```properties
+versionName=1.0.1
+```
+
+版本号（`versionCode`）不单独维护，由版本名推导：
+
+```
+versionCode = major * 10000 + minor * 100 + patch
+```
+
+`1.0.1` → `10001`，`1.2.3` → `10203`。minor 与 patch 各自不超过 99，够用到 4.x。这样同一个版本名永远得到同一个版本号，本地构建与 CI 构建不会错位。
+
+预发布后缀不参与推导：`1.0.2-rc1` 与 `1.0.2` 同为 `10201`，`versionName` 保留完整后缀，Release 页面据标签名标成 pre-release。
+
+### 三处取值的优先级
+
+**versionName**：
+
+| 顺序 | 来源 | 何时生效 |
+| --- | --- | --- |
+| 1 | 标签名去掉 `v` | 推送 `v*` 标签时 |
+| 2 | 手动触发的 `version_name` 输入 | Actions 页面 `Run workflow` 且填了值 |
+| 3 | `version.properties` | 其余所有情况，包括本地构建 |
+
+**versionCode**：默认不传，交给 `app/build.gradle` 从版本名推导。只有手动触发时填了 `version_code`，才用该值覆盖。
+
+环境变量层面，`VERSION_NAME` 与 `VERSION_CODE` 都能覆盖上述结果；`KEYSTORE_PATH` 等签名变量同理。本地不设这些变量就走默认路径。
+
+### 与原包的差异
+
+原包 `versionCode` 为 `3`。本工程改成派生值后首个版本是 `10001`，**不再与原包一致**——这是有意的取舍，换来自动化的版本管理。`package`、`versionName`、`minSdk`、`targetSdk`、权限、启动 Activity 仍与原包一致。
+
+发版流程因此只有两步：
+
+```bash
+# 需要提版本时改这一行
+sed -i 's/^versionName=.*/versionName=1.0.2/' version.properties
+git commit -am "chore(release): 1.0.2"
+git tag v1.0.2 && git push origin main v1.0.2
+```
+
+标签触发后 CI 会构建、签名并发布，`versionName` 与 `versionCode` 都从标签名推出，无需再手工同步。
 
 ---
 
@@ -248,13 +398,19 @@ adb install -r app-release-signed.apk
 
 ```
 ClaudeCN-android/
-├── .github/workflows/android.yml     # CI：构建 debug + lint + 上传产物
+├── .github/
+│   ├── release-notes/                # 手写发布说明，v<version>.md
+│   └── workflows/android.yml         # CI：标签/手动触发，构建签名包并发 Release
 ├── app/
-│   ├── build.gradle                  # 应用模块：版本、SDK、Java 17
+│   ├── build.gradle                  # 应用模块：版本、SDK、Java 17、ABI 分包、签名
 │   ├── proguard-rules.pro            # 默认规则（release 未开启混淆）
 │   └── src/main/
 │       ├── AndroidManifest.xml       # 权限与四个 Activity
+│       ├── cpp/
+│       │   ├── CMakeLists.txt        # 仅编译 abi.c 为 libclaudecn.so
+│       │   └── abi.c                 # JNI：按编译期宏自报 ABI
 │       ├── java/com/host1syan/claudecn/
+│       │   ├── NativeAbi.java        # 加载 libclaudecn.so，失败降级「未加载」
 │       │   ├── cache/
 │       │   │   ├── AssetCache.java       # 磁盘缓存读写、大小统计、清空
 │       │   │   ├── CacheKey.java         # URL → SHA-1 文件名映射
@@ -283,6 +439,7 @@ ClaudeCN-android/
 ├── gradle.properties                 # Gradle 与 Android 构建开关
 ├── gradle/wrapper/                   # Gradle 8.7 wrapper
 ├── gradlew / gradlew.bat
+├── version.properties                # 版本名的唯一来源
 ├── .gitignore
 └── README.md
 ```
@@ -303,7 +460,7 @@ ClaudeCN-android/
 ## 已知限制
 
 - `usesCleartextTraffic="true"`：允许 http 地址，便于在内网部署官方服务端。公网使用时建议只填 https。
-- release 变体不带签名配置，必须自行签名后才能安装。
+- release 包只有在 `KEYSTORE_PATH` 等环境变量齐全时才自动签名，否则产出 unsigned 包。
 - 缓存只覆盖静态资源与入口 HTML，`/api/` 等动态请求始终走网络。
 - 令牌以明文保存在 `SharedPreferences` 中，依赖 Android 的应用沙箱隔离；设备已 root 时无法防止读取。
 - 状态圆点的 DOM 兜底依赖页面上的 `aria-label` / `data-testid`，前端结构大改后可能需要更新匹配串；WebSocket 解析为主要来源。
