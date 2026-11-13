@@ -21,6 +21,9 @@ captures/
 # 本地打包输出（release APK / 源码 zip）
 dist/
 
+# 签名材料：keystore、口令、base64 副本，绝不入库
+signing/
+
 # 系统文件
 .DS_Store
 Thumbs.db
