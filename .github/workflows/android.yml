@@ -24,17 +24,43 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
+      # ubuntu-latest 镜像已预装 Android SDK（platforms;android-34、build-tools;34.0.0），
+      # 缺件时才补装，不依赖 android-actions/setup-android。
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages
         run: |
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+          set -euo pipefail
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            echo "ANDROID_HOME 未设置，runner 镜像缺少 Android SDK" >&2
+            exit 1
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          fi
+
+          install_if_missing() {
+            local path="$1" pkg="$2"
+            if [ -d "$ANDROID_HOME/$path" ]; then
+              echo "已预装: $pkg"
+              return 0
+            fi
+            echo "安装: $pkg"
+            # yes 会因 sdkmanager 提前关管道收到 SIGPIPE，pipefail 下需容忍
+            yes | sdkmanager --install "$pkg" >/dev/null || true
+            if [ ! -d "$ANDROID_HOME/$path" ]; then
+              echo "安装后仍缺少 $ANDROID_HOME/$path" >&2
+              return 1
+            fi
+          }
+
+          install_if_missing platforms/android-34 "platforms;android-34"
+          install_if_missing build-tools/34.0.0 "build-tools;34.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
