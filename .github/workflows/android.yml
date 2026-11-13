@@ -156,17 +156,66 @@ jobs:
           fi
           echo "body_path=${body}" >> "$GITHUB_OUTPUT"
 
+      # 失败时用 ::error:: 写 annotation，无需登录也能在 Actions 页面看到具体原因。
       - name: Decode signing keystore
         env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          # 两个名字都认：KEYSTORE_BASE64 是文档里的正式名，
+          # KEYSTORE_B64 是本步骤历史变量名，照它建 secret 也能生效。
+          B64_MAIN: ${{ secrets.KEYSTORE_BASE64 }}
+          B64_ALT: ${{ secrets.KEYSTORE_B64 }}
         run: |
           set -euo pipefail
+
+          KEYSTORE_B64="${B64_MAIN:-}"
+          used="KEYSTORE_BASE64"
+          if [ -z "${KEYSTORE_B64}" ] && [ -n "${B64_ALT:-}" ]; then
+            KEYSTORE_B64="${B64_ALT}"
+            used="KEYSTORE_B64"
+          fi
+
           if [ -z "${KEYSTORE_B64}" ]; then
-            echo "缺少 KEYSTORE_BASE64 secret，无法签名 release 包" >&2
+            echo "::error::签名 secret 缺失：KEYSTORE_BASE64 与 KEYSTORE_B64 都为空"
+            echo "请到 Settings → Secrets and variables → Actions 添加其中一个，"
+            echo "内容为单行 base64：base64 -w 0 my-release.jks（macOS 用 base64 -i my-release.jks）"
             exit 1
           fi
-          printf '%s' "${KEYSTORE_B64}" | base64 --decode > "${RUNNER_TEMP}/release.jks"
-          echo "keystore 已写入 ${RUNNER_TEMP}/release.jks"
+          echo "使用 secret: ${used}"
+
+          # 容忍粘贴时带入的换行、空白，以及 data:...;base64, 前缀
+          cleaned="$(printf '%s' "${KEYSTORE_B64}" | tr -d '\r\n\t ' | sed 's/^data:[^,]*,//')"
+          echo "secret 原始长度 ${#KEYSTORE_B64} 字符，清洗后 ${#cleaned} 字符"
+
+          if ! printf '%s' "${cleaned}" | base64 --decode > "${RUNNER_TEMP}/release.jks" 2>"${RUNNER_TEMP}/b64.err"; then
+            echo "::error::KEYSTORE_BASE64 不是合法的 base64：$(cat "${RUNNER_TEMP}/b64.err")"
+            exit 1
+          fi
+
+          size="$(stat -c %s "${RUNNER_TEMP}/release.jks")"
+          if [ "${size}" -lt 1000 ]; then
+            echo "::error::解码后仅 ${size} 字节，疑似 secret 内容被截断（完整 jks 通常 2 KB 以上）"
+            exit 1
+          fi
+
+          echo "keystore 已写入 ${RUNNER_TEMP}/release.jks（${size} 字节）"
+
+      # 签名材料缺任一项时 Gradle 会静默产出 unsigned 包且构建仍然成功，
+      # 因此在这里提前拦下，避免把没签名的包发出去。
+      - name: Check signing secrets
+        env:
+          STORE_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PW: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${STORE_PW:-}" ] || missing="${missing} KEYSTORE_PASSWORD"
+          [ -n "${ALIAS:-}" ]    || missing="${missing} KEY_ALIAS"
+          [ -n "${KEY_PW:-}" ]   || missing="${missing} KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:${missing}"
+            exit 1
+          fi
+          echo "签名 secret 齐全（KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD）"
 
       - name: Build release APKs
         env:
